@@ -1,70 +1,6 @@
 # foo_cover_finder
 
-Finds album art online and saves the one you pick as `cover.jpg` in the album folder — right from the foobar2000 playlist context menu.
-
-中文见下。
-
-## Two ways to use it
-
-- **One album:** right-click the album in the playlist → *Find cover art (online)* → pick from the previews. Anything goes here: you see the candidates before committing.
-- **The whole library:** *Library → Fill missing cover art...* scans the media library, lists the albums that have no cover art, and fills the ones it can match with confidence. Nothing is written before you confirm, and unmatched albums are reported so you can handle them with the single-album flow.
-
-## What it does
-
-Right-click one or more tracks of an album → **Find cover art (online)**.
-
-1. Reads `%album%` and `%album artist%` (falling back to `%artist%`) from the selection, and insists the selection stays inside one folder.
-2. Searches four sources at once, none of which needs an API key: **iTunes** (JP store), **NetEase Cloud Music**, **QQ Music** and **MusicBrainz** (artwork via Cover Art Archive).
-3. Scores the hits against your tags, drops the obvious misses, and shows the best 12 as thumbnails in a picker.
-4. Downloads the full-size image of the one you choose and stores it where it actually belongs:
-   - **Album folder** (everything in it belongs to this album): written as `cover.jpg`, asking first if one is already there.
-   - **Mixed folder** (the folder holds tracks from other albums too, checked against the media library): written into the tags of each selected file instead, because a `cover.jpg` there would show up on every unrelated track. You are asked before any file is rewritten, and formats that cannot hold artwork are skipped and counted.
-
-Nothing is written if you cancel, and no tags are touched — foobar2000 (and every other player) picks up `cover.jpg` from the folder on its own.
-
-## Batch mode notes
-
-- "No cover art" is judged the way the display judges it: embedded artwork, folder pictures and the album art search patterns configured in the preferences all count.
-- In a mixed folder, only embedded artwork counts (a folder picture there belongs to the folder, not to the album).
-- Batch mode only applies a candidate whose album name matches exactly — nobody is looking at previews — so uncertain albums are left alone instead of getting the wrong picture.
-- MusicBrainz is probed less deeply in batch mode, since its 1 request/second limit would otherwise dominate the run time.
-
-## Notes
-
-- Every source is asked with the terms it actually handles: iTunes by artist *and* by album title (a combined "<artist> <album>" term returns nothing surprisingly often), QQ Music twice with the same terms, NetEase with the combination, MusicBrainz with a `release:"…" AND artist:"…"` query.
-- QQ Music's real search API is signed; this uses its key-less suggestion endpoint, which returns a couple of albums per query — enough to find the right one, not a full catalogue.
-- MusicBrainz only indexes metadata, so each candidate costs one extra Cover Art Archive request. To respect the 1 request/second rule the search sleeps between probes and only probes the top three releases, which makes a search take about three seconds longer.
-- Matching strips `- Single`, `- EP`, `(Cover)` and similar tails, and ignores case, so `迷星叫 - Single` still matches the tag `迷星叫`.
-- The folder is inspected through the media library, so only albums that are actually in the library are considered; when nothing is known about the folder it is treated as a single album.
-- If a source fails (offline, blocked, rate limited) the others are still used, and the reason is printed to the Console.
-- If nothing relevant turns up, the unfiltered hits are shown rather than an empty dialog — better a wrong cover you can reject than a dead end.
-
-## Build
-
-Same setup as the other components here: VS2022 Build Tools with the C++ workload and ATL, plus a Windows SDK.
-
-The SDK, WTL and cJSON are not vendored; they come from a neighbouring `foo_openlyrics` checkout:
-
-```
-repos/
-  foo_openlyrics/3rdparty/{foo_SDK,WTL10_10320_Release,cJSON}
-  foo_cover_finder/
-```
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File build\build.ps1
-# -> build\x64\Release\foo_cover_finder.dll
-```
-
-Copy the DLL to `%APPDATA%\foobar2000-v2\user-components-x64\foo_cover_finder\` and restart foobar2000.
-
-## Licence
-
-MIT.
-
----
-
-# 中文说明
+[English version below ⬇](#english)
 
 在 foobar2000 的播放列表右键菜单里给专辑找封面，选中的图存成专辑文件夹里的 `cover.jpg`。
 
@@ -125,3 +61,67 @@ powershell -NoProfile -ExecutionPolicy Bypass -File build\build.ps1
 ## 许可
 
 MIT。
+
+---
+
+# English
+
+Finds album art online and saves the one you pick as `cover.jpg` in the album folder — right from the foobar2000 playlist context menu.
+
+## Two ways to use it
+
+- **One album:** right-click the album in the playlist → *Find cover art (online)* → pick from the previews. Anything goes here: you see the candidates before committing.
+- **The whole library:** *Library → Fill missing cover art...* scans the media library, lists the albums that have no cover art, and fills the ones it can match with confidence. Nothing is written before you confirm, and unmatched albums are reported so you can handle them with the single-album flow.
+
+## What it does
+
+Right-click one or more tracks of an album → **Find cover art (online)**.
+
+1. Reads `%album%` and `%album artist%` (falling back to `%artist%`) from the selection, and insists the selection stays inside one folder.
+2. Searches four sources at once, none of which needs an API key: **iTunes** (JP store), **NetEase Cloud Music**, **QQ Music** and **MusicBrainz** (artwork via Cover Art Archive).
+3. Scores the hits against your tags, drops the obvious misses, and shows the best 12 as thumbnails in a picker.
+4. Downloads the full-size image of the one you choose and stores it where it actually belongs:
+   - **Album folder** (everything in it belongs to this album): written as `cover.jpg`, asking first if one is already there.
+   - **Mixed folder** (the folder holds tracks from other albums too, checked against the media library): written into the tags of each selected file instead, because a `cover.jpg` there would show up on every unrelated track. You are asked before any file is rewritten, and formats that cannot hold artwork are skipped and counted.
+
+Nothing is written if you cancel, and no tags are touched — foobar2000 (and every other player) picks up `cover.jpg` from the folder on its own.
+
+## Batch mode notes
+
+- "No cover art" is judged the way the display judges it: embedded artwork, folder pictures and the album art search patterns configured in the preferences all count.
+- In a mixed folder, only embedded artwork counts (a folder picture there belongs to the folder, not to the album).
+- Batch mode only applies a candidate whose album name matches exactly — nobody is looking at previews — so uncertain albums are left alone instead of getting the wrong picture.
+- MusicBrainz is probed less deeply in batch mode, since its 1 request/second limit would otherwise dominate the run time.
+
+## Notes
+
+- Every source is asked with the terms it actually handles: iTunes by artist *and* by album title (a combined "<artist> <album>" term returns nothing surprisingly often), QQ Music twice with the same terms, NetEase with the combination, MusicBrainz with a `release:"…" AND artist:"…"` query.
+- QQ Music's real search API is signed; this uses its key-less suggestion endpoint, which returns a couple of albums per query — enough to find the right one, not a full catalogue.
+- MusicBrainz only indexes metadata, so each candidate costs one extra Cover Art Archive request. To respect the 1 request/second rule the search sleeps between probes and only probes the top three releases, which makes a search take about three seconds longer.
+- Matching strips `- Single`, `- EP`, `(Cover)` and similar tails, and ignores case, so `迷星叫 - Single` still matches the tag `迷星叫`.
+- The folder is inspected through the media library, so only albums that are actually in the library are considered; when nothing is known about the folder it is treated as a single album.
+- If a source fails (offline, blocked, rate limited) the others are still used, and the reason is printed to the Console.
+- If nothing relevant turns up, the unfiltered hits are shown rather than an empty dialog — better a wrong cover you can reject than a dead end.
+
+## Build
+
+Same setup as the other components here: VS2022 Build Tools with the C++ workload and ATL, plus a Windows SDK.
+
+The SDK, WTL and cJSON are not vendored; they come from a neighbouring `foo_openlyrics` checkout:
+
+```
+repos/
+  foo_openlyrics/3rdparty/{foo_SDK,WTL10_10320_Release,cJSON}
+  foo_cover_finder/
+```
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File build\build.ps1
+# -> build\x64\Release\foo_cover_finder.dll
+```
+
+Copy the DLL to `%APPDATA%\foobar2000-v2\user-components-x64\foo_cover_finder\` and restart foobar2000.
+
+## Licence
+
+MIT.
