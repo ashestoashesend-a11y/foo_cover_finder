@@ -147,7 +147,8 @@ private:
         pfc::string8 text;
         if (index >= 0 && (size_t)index < candidates->size()) {
             const CoverCandidate & candidate = (*candidates)[index];
-            text << candidate.album << " \xE2\x80\x94 " << candidate.artist << "    (" << candidate.source;
+            text << candidate.album << " \xE2\x80\x94 " << candidate.artist << "    (" << candidate.source
+                 << (candidate.approx ? ", different edition" : "");
             if (candidate.width > 0) text << ", " << candidate.width << " px";
             text << ")    [" << (index + 1) << " / " << (unsigned)candidates->size() << "]";
         }

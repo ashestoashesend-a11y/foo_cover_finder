@@ -269,12 +269,52 @@ std::string normalized(const char * text) {
     return result;
 }
 
-int score_candidate(const char * wanted_album, const char * wanted_artist, const CoverCandidate & candidate) {
-    const std::string album = normalized(wanted_album);
-    const std::string artist = normalized(wanted_artist);
-    const std::string got_album = normalized(candidate.album);
-    const std::string got_artist = normalized(candidate.artist);
+// Is this bracket actually a variant marker rather than part of the title?
+bool is_variant_marker(const std::string & inner) {
+    static const char * const words[] = { "deluxe",      "edition",        "remaster", "explicit", "expanded",
+                                          "anniversary", "bonus",          "special",  "collector", "re-release",
+                                          "soundtrack",  "motion picture", "ost",      "complete",  "mono",
+                                          "stereo",      "reissue",        "live",     "feat",      "version",
+                                          "music from the" };
+    for (size_t i = 0; i < _countof(words); i++) {
+        if (inner.find(words[i]) != std::string::npos) return true;
+    }
+    return false;
+}
 
+// "Brave Enough (Deluxe Edition)" and "Brave Enough" are the same record as far
+// as the artwork goes. Stripping variants only ever *raises* a score to a match
+// that is then flagged, never to one that is written silently.
+std::string normalized_loose(const char * text) {
+    std::string result = normalized(text);
+    bool stripped = true;
+    while (stripped) {
+        stripped = false;
+        if (result.size() < 3) break;
+        const char closing = result[result.size() - 1];
+        if (closing != ')' && closing != ']') break;
+        const char opening = closing == ')' ? '(' : '[';
+        const size_t open = result.rfind(opening);
+        if (open == std::string::npos || open + 1 >= result.size() - 1) break;
+        if (!is_variant_marker(result.substr(open + 1, result.size() - open - 2))) break;
+        result.erase(open);
+        while (!result.empty() && result[result.size() - 1] == ' ') result.erase(result.size() - 1);
+        stripped = true;
+    }
+    // "... OST" without brackets
+    const char * const tails[] = { " ost", " original soundtrack", " ep" };
+    for (size_t i = 0; i < _countof(tails); i++) {
+        const std::string tail(tails[i]);
+        if (result.size() > tail.size() && result.compare(result.size() - tail.size(), tail.size(), tail) == 0) {
+            result.erase(result.size() - tail.size());
+            break;
+        }
+    }
+    return result;
+}
+
+int score_pair(const std::string & album, const std::string & artist, const std::string & got_album,
+               const std::string & got_artist) {
     int score = 0;
     // The substring rules need a length floor: a one-letter album name is a
     // substring of half the catalogue ("R" matching "avant-garde history").
@@ -295,6 +335,27 @@ int score_candidate(const char * wanted_album, const char * wanted_artist, const
             score += 15;
     }
     return score;
+}
+
+// Scores a candidate twice: once as written, once with variant markers ignored.
+// A match that only appears in the second pass is marked, so the chooser and the
+// batch review can say so instead of pretending it is exact.
+int score_candidate(const char * wanted_album, const char * wanted_artist, CoverCandidate & candidate) {
+    const std::string artist = normalized(wanted_artist);
+    const std::string got_artist = normalized(candidate.artist);
+
+    const int strict = score_pair(normalized(wanted_album), artist, normalized(candidate.album), got_artist);
+    if (strict >= 100) {
+        candidate.approx = false;
+        return strict;
+    }
+    const int loose = score_pair(normalized_loose(wanted_album), artist, normalized_loose(candidate.album), got_artist);
+    if (loose > strict) {
+        candidate.approx = loose >= 100; // only call it approximate when it reaches "exact" by ignoring variants
+        return loose;
+    }
+    candidate.approx = false;
+    return strict;
 }
 
 // -------------------------------------------------------------- sources ----
@@ -1199,7 +1260,7 @@ public:
             // match is applied; the rest is left to the single-album flow.
             size_t chosen = candidates.size();
             for (size_t c = 0; c < candidates.size(); c++) {
-                if (candidates[c].score >= 100) {
+                if (candidates[c].score >= 100 && !candidates[c].approx) {
                     chosen = c;
                     break;
                 }
@@ -1415,18 +1476,19 @@ void cover_batch_run() {
     t_size applied = 0;
     if (!fill->m_near.empty()) {
         for (size_t i = 0; i < fill->m_near.size(); i++) {
-            console::print(pfc::string8("Close match: ") << fill->m_near[i].entry.album << " -> "
-                                                         << fill->m_near[i].candidate.album << " ("
-                                                         << fill->m_near[i].candidate.source << ", score "
-                                                         << fill->m_near[i].candidate.score << ")");
+            console::print(pfc::string8("Close match: ")
+                           << fill->m_near[i].entry.album << " -> " << fill->m_near[i].candidate.album << " ("
+                           << fill->m_near[i].candidate.source << ", score " << fill->m_near[i].candidate.score
+                           << (fill->m_near[i].candidate.approx ? ", same name, different edition" : "") << ")");
         }
 
         pfc::string8 list;
         list << (t_size)fill->m_near.size()
              << " album(s) only matched approximately, so they were left alone:\n\n";
         for (size_t i = 0; i < fill->m_near.size() && i < 15; i++) {
-            list << "  " << fill->m_near[i].entry.album << "\n      -> " << fill->m_near[i].candidate.album
-                 << "  (" << fill->m_near[i].candidate.source << ")\n";
+            list << "  " << fill->m_near[i].entry.album << "\n      -> " << fill->m_near[i].candidate.album << "  ("
+                 << fill->m_near[i].candidate.source
+                 << (fill->m_near[i].candidate.approx ? ", same name, different edition" : "") << ")\n";
         }
         if (fill->m_near.size() > 15)
             list << "  ... and " << (t_size)(fill->m_near.size() - 15) << " more (see the Console)\n";
@@ -1452,7 +1514,8 @@ void cover_batch_run() {
 
     pfc::string8 summary("Cover art filled for ");
     summary << (fill->m_filled + applied) << " of " << scan->m_missing.size() << " album(s)";
-    if (applied > 0) summary << " (" << applied << " from close matches)";
+    if (applied > 0) summary << " (" << applied << " you approved";
+    if (applied > 0) summary << ")";
     if (!fill->m_unmatched.empty()) summary << ", " << fill->m_unmatched.size() << " without a confident match";
     if (!fill->m_failed.empty()) summary << ", " << fill->m_failed.size() << " failed";
     console::print(summary);

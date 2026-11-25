@@ -11,6 +11,7 @@ struct CoverCandidate {
     pfc::string8 image_url; // full size image, what actually gets saved
     int width = 0;          // nominal width in pixels, 0 when the source does not say
     int score = 0;          // how well this matches the tags being searched for
+    bool approx = false;    // matched only after ignoring "(Deluxe Edition)" style markers
     pfc::array_t<t_uint8> thumb; // downloaded thumbnail bytes (JPEG/PNG)
 };
 
