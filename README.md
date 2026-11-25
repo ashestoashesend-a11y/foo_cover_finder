@@ -4,6 +4,11 @@ Finds album art online and saves the one you pick as `cover.jpg` in the album fo
 
 中文见下。
 
+## Two ways to use it
+
+- **One album:** right-click the album in the playlist → *Find cover art (online)* → pick from the previews. Anything goes here: you see the candidates before committing.
+- **The whole library:** *Library → Fill missing cover art...* scans the media library, lists the albums that have no cover art, and fills the ones it can match with confidence. Nothing is written before you confirm, and unmatched albums are reported so you can handle them with the single-album flow.
+
 ## What it does
 
 Right-click one or more tracks of an album → **Find cover art (online)**.
@@ -16,6 +21,13 @@ Right-click one or more tracks of an album → **Find cover art (online)**.
    - **Mixed folder** (the folder holds tracks from other albums too, checked against the media library): written into the tags of each selected file instead, because a `cover.jpg` there would show up on every unrelated track. You are asked before any file is rewritten, and formats that cannot hold artwork are skipped and counted.
 
 Nothing is written if you cancel, and no tags are touched — foobar2000 (and every other player) picks up `cover.jpg` from the folder on its own.
+
+## Batch mode notes
+
+- "No cover art" is judged the way the display judges it: embedded artwork, folder pictures and the album art search patterns configured in the preferences all count.
+- In a mixed folder, only embedded artwork counts (a folder picture there belongs to the folder, not to the album).
+- Batch mode only applies a candidate whose album name matches exactly — nobody is looking at previews — so uncertain albums are left alone instead of getting the wrong picture.
+- MusicBrainz is probed less deeply in batch mode, since its 1 request/second limit would otherwise dominate the run time.
 
 ## Notes
 
@@ -56,6 +68,11 @@ MIT.
 
 在 foobar2000 的播放列表右键菜单里给专辑找封面，选中的图存成专辑文件夹里的 `cover.jpg`。
 
+## 两种用法
+
+- **单张专辑**：播放列表里右键那张专辑 → *Find cover art (online)* → 从预览里挑一张。这条路上什么都能看到，先看再决定。
+- **整个媒体库**：*Library → Fill missing cover art...*，扫描媒体库、列出没有封面的专辑，把有把握的自动补齐。动手之前一定会先问你，补不了的会列出来，用单张流程手动处理。
+
 ## 用法
 
 选中**同一张专辑**的曲目 → 右键 → **Find cover art (online)**。
@@ -68,6 +85,13 @@ MIT.
    - **混装文件夹**（文件夹里还有别的专辑的曲子，用媒体库核对）：改成**写进选中曲目自己的标签**，因为 `cover.jpg` 会让这个文件夹里所有无关曲目都显示这张封面。重写文件之前一定会先问你，不支持的格式会跳过并计数。
 
 取消就什么都不写，也不会动标签——foobar2000 和其他播放器都会自己从文件夹读 `cover.jpg`。
+
+## 批量模式的说明
+
+- 「有没有封面」的判定跟界面一致：嵌入的封面、文件夹图片、偏好设置里配置的封面搜索规则，都算有。
+- 混装文件夹里只认**嵌入的**封面（那里的文件夹图片属于整个文件夹，不属于某张专辑）。
+- 批量模式只应用**专辑名精确匹配**的候选——没人在看预览，所以没把握的宁可放过，也不写错图。
+- 批量时 MusicBrainz 探测得更浅，否则它「每秒最多 1 次」的限制会主导整个耗时。
 
 ## 说明
 

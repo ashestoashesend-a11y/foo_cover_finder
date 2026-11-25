@@ -4,11 +4,13 @@
 #include "cover_chooser.h"
 
 #include <SDK/album_art_helpers.h>
+#include <SDK/menu.h>
 
 #include <cJSON.h>
 #include <winhttp.h>
 
 #include <algorithm>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -28,6 +30,21 @@ void show_error(const char * message) {
         query.msg = message;
         query.buttons = popup_message_v3::buttonOK;
         query.icon = popup_message_v3::iconError;
+        query.wndParent = core_api::get_main_window();
+        api->show_query_modal(query);
+        return;
+    }
+    popup_message_v2::g_show(core_api::get_main_window(), message, "Find cover art");
+}
+
+void show_info(const char * message) {
+    popup_message_v3::ptr api;
+    if (popup_message_v3::tryGet(api)) {
+        popup_message_v3::query_t query;
+        query.title = "Find cover art";
+        query.msg = message;
+        query.buttons = popup_message_v3::buttonOK;
+        query.icon = popup_message_v3::iconInformation;
         query.wndParent = core_api::get_main_window();
         api->show_query_modal(query);
         return;
@@ -228,6 +245,26 @@ std::string normalized(const char * text) {
                 trimmed = true;
             }
         }
+        // "FIRE BIRD (火鸟)" is the same album as "FIRE BIRD": a trailing
+        // parenthetical without a single ASCII letter is a translation someone
+        // appended to the tag, not part of the title.
+        if (result.size() > 3 && result[result.size() - 1] == ')') {
+            const size_t open = result.rfind('(');
+            if (open != std::string::npos && open + 1 < result.size() - 1) {
+                bool has_ascii_letter = false;
+                for (size_t i = open + 1; i < result.size() - 1; i++) {
+                    const unsigned char c = (unsigned char)result[i];
+                    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
+                        has_ascii_letter = true;
+                        break;
+                    }
+                }
+                if (!has_ascii_letter) {
+                    result.erase(open);
+                    trimmed = true;
+                }
+            }
+        }
     }
     return result;
 }
@@ -398,7 +435,8 @@ pfc::string8 first_artist_credit(cJSON * release) {
 // MusicBrainz only indexes the metadata; the images live at Cover Art Archive,
 // one extra request per release, and MusicBrainz asks for at most one request a
 // second - hence the sleeps and the small probe budget.
-void musicbrainz_query(const char * query, std::vector<CoverCandidate> & out, abort_callback & abort, pfc::string8 & error) {
+void musicbrainz_query(const char * query, std::vector<CoverCandidate> & out, abort_callback & abort, pfc::string8 & error,
+                       t_size max_probes) {
     pfc::string8 url("https://musicbrainz.org/ws/2/release/?query=");
     url_encode(query, url);
     url << "&fmt=json&limit=6";
@@ -419,7 +457,7 @@ void musicbrainz_query(const char * query, std::vector<CoverCandidate> & out, ab
     cJSON * releases = cJSON_GetObjectItem(root, "releases");
     const int count = cJSON_GetArraySize(releases);
     int probed = 0;
-    for (int i = 0; i < count && probed < 3; i++) {
+    for (int i = 0; i < count && (t_size)probed < max_probes; i++) {
         if (abort.is_aborting()) break;
         cJSON * release = cJSON_GetArrayItem(releases, i);
         const char * id = json_string(release, "id");
@@ -455,7 +493,7 @@ void musicbrainz_query(const char * query, std::vector<CoverCandidate> & out, ab
 // every source with the terms it handles, merge, score against the tags and
 // keep the best few.
 void collect_candidates(const char * artist, const char * album, std::vector<CoverCandidate> & out, abort_callback & abort,
-                        pfc::string8 & error) {
+                        pfc::string8 & error, t_size mb_probes = 3) {
     std::vector<CoverCandidate> raw;
 
     pfc::string8 artist_query(artist);
@@ -480,7 +518,7 @@ void collect_candidates(const char * artist, const char * album, std::vector<Cov
     pfc::string8 mb_query("release:\"");
     mb_query << album_query << "\"";
     if (!artist_query.is_empty()) mb_query << " AND artist:\"" << artist_query << "\"";
-    musicbrainz_query(mb_query, raw, abort, error);
+    musicbrainz_query(mb_query, raw, abort, error, mb_probes);
     if (abort.is_aborting()) return;
 
     for (size_t i = 0; i < raw.size(); i++) raw[i].score = score_candidate(album, artist, raw[i]);
@@ -866,3 +904,294 @@ void cover_finder_run(metadb_handle_list_cref items) {
     console::print(done);
     fb2k::showToast(done);
 }
+
+// ------------------------------------------------------------- batch mode --
+
+namespace {
+
+struct BatchAlbum {
+    pfc::string8 folder;
+    pfc::string8 album;
+    pfc::string8 artist;
+    metadb_handle_list items;
+};
+
+// Asked the same way the display does, so "has art" means what you see: embedded
+// artwork, a folder picture, or one matched by the configured patterns.
+bool has_front_cover(metadb_handle_list_cref items) {
+    try {
+        pfc::list_t<GUID> ids;
+        ids.add_item(album_art_ids::cover_front);
+        album_art_extractor_instance_v2::ptr extractor = album_art_manager_v2::get()->open(items, ids, fb2k::noAbort);
+        album_art_data::ptr art;
+        if (!extractor->query(album_art_ids::cover_front, art, fb2k::noAbort)) return false;
+        return art.is_valid() && art->get_size() > 0;
+    } catch (std::exception const &) {
+        return false; // unreadable counts as missing, the fill step reports the details
+    }
+}
+
+// Folder pictures belong to the folder, so in a mixed folder they say nothing
+// about a single album: there only the file's own artwork counts.
+bool has_embedded_cover(const metadb_handle_ptr & item) {
+    try {
+        album_art_extractor_instance_ptr extractor = album_art_extractor::g_open(NULL, item->get_path(), fb2k::noAbort);
+        album_art_data::ptr art;
+        if (!extractor->query(album_art_ids::cover_front, art, fb2k::noAbort)) return false;
+        return art.is_valid() && art->get_size() > 0;
+    } catch (std::exception const &) {
+        return false;
+    }
+}
+
+bool album_has_cover(const BatchAlbum & entry, bool mixed) {
+    if (!mixed) return has_front_cover(entry.items);
+    for (t_size i = 0; i < entry.items.get_count(); i++) {
+        if (!has_embedded_cover(entry.items[i])) return false;
+    }
+    return true;
+}
+
+// One album == one folder plus one album tag, so loose tracks in a shared folder
+// end up as their own entries instead of one giant album.
+class BatchScanTask : public threaded_process_callback {
+public:
+    void run(threaded_process_status & status, abort_callback & abort) override {
+        status.set_item("Reading the media library");
+        metadb_handle_list everything;
+        library_manager::get()->get_all_items(everything);
+
+        std::vector<BatchAlbum> albums;
+        std::map<std::string, size_t> seen;
+        for (t_size i = 0; i < everything.get_count(); i++) {
+            if (abort.is_aborting()) throw exception_aborted();
+            pfc::string8 folder;
+            if (!folder_of(everything[i], folder)) continue;
+
+            const file_info & info = everything[i]->get_info_ref()->info();
+            const char * album = info.meta_get("album", 0);
+            if (album == NULL || *album == 0) continue; // nothing to search for
+
+            std::string key = lowered(folder.get_ptr());
+            key += '|';
+            key += normalized(album);
+            std::map<std::string, size_t>::iterator known = seen.find(key);
+            if (known != seen.end()) {
+                albums[known->second].items.add_item(everything[i]);
+                continue;
+            }
+
+            BatchAlbum entry;
+            entry.folder = folder;
+            entry.album = album;
+            const char * album_artist = info.meta_get("album artist", 0);
+            if (album_artist != NULL && *album_artist != 0) {
+                entry.artist = album_artist;
+            } else {
+                const char * artist = info.meta_get("artist", 0);
+                entry.artist = artist != NULL ? artist : "";
+            }
+            entry.items.add_item(everything[i]);
+            seen[key] = albums.size();
+            albums.push_back(entry);
+        }
+
+        for (size_t i = 0; i < albums.size(); i++) {
+            if (abort.is_aborting()) throw exception_aborted();
+            status.set_item(albums[i].album);
+            t_size tracks_in_folder = 0;
+            const bool mixed = folder_is_mixed(albums[i].folder, albums[i].album, tracks_in_folder);
+            if (!album_has_cover(albums[i], mixed)) m_missing.push_back(albums[i]);
+        }
+        m_scanned = albums.size();
+        status.set_item("");
+    }
+
+    std::vector<BatchAlbum> m_missing;
+    t_size m_scanned = 0;
+};
+
+class BatchFillTask : public threaded_process_callback {
+public:
+    BatchFillTask(const std::vector<BatchAlbum> & albums) : m_albums(albums) {}
+
+    void run(threaded_process_status & status, abort_callback & abort) override {
+        for (size_t i = 0; i < m_albums.size(); i++) {
+            if (abort.is_aborting()) throw exception_aborted();
+            const BatchAlbum & entry = m_albums[i];
+            status.set_item(entry.album);
+
+            std::vector<CoverCandidate> candidates;
+            pfc::string8 search_error;
+            collect_candidates(entry.album, entry.artist, candidates, abort, search_error, 1);
+            if (abort.is_aborting()) throw exception_aborted();
+
+            // Nobody is here to look at previews, so only an exact album name
+            // match is applied; the rest is left to the single-album flow.
+            size_t chosen = candidates.size();
+            for (size_t c = 0; c < candidates.size(); c++) {
+                if (candidates[c].score >= 100) {
+                    chosen = c;
+                    break;
+                }
+            }
+            if (chosen == candidates.size()) {
+                m_unmatched.push_back(describe(entry));
+                continue;
+            }
+
+            pfc::array_t<t_uint8> bytes;
+            pfc::string8 download_error;
+            if (!http_get(candidates[chosen].image_url, NULL, bytes, abort, download_error) || bytes.get_size() == 0) {
+                m_failed.push_back(describe(entry));
+                continue;
+            }
+
+            t_size tracks_in_folder = 0;
+            if (folder_is_mixed(entry.folder, entry.album, tracks_in_folder)) {
+                if (!embed(entry.items, bytes, abort)) {
+                    m_failed.push_back(describe(entry));
+                    continue;
+                }
+            } else if (!write_folder_cover(entry, bytes, abort)) {
+                m_failed.push_back(describe(entry));
+                continue;
+            }
+
+            metadb_io::get()->dispatch_refresh(entry.items);
+            m_filled++;
+        }
+        status.set_item("");
+    }
+
+    t_size m_filled = 0;
+    std::vector<pfc::string8> m_unmatched;
+    std::vector<pfc::string8> m_failed;
+
+private:
+    static pfc::string8 describe(const BatchAlbum & entry) {
+        pfc::string8 text(entry.album);
+        if (!entry.artist.is_empty()) text << "  (" << entry.artist << ")";
+        return text;
+    }
+
+    static bool embed(metadb_handle_list_cref items, const pfc::array_t<t_uint8> & bytes, abort_callback & abort) {
+        album_art_data_ptr data;
+        try {
+            data = album_art_data_impl::g_create(bytes.get_ptr(), bytes.get_size());
+        } catch (std::exception const &) {
+            return false;
+        }
+        t_size written = 0;
+        for (t_size i = 0; i < items.get_count(); i++) {
+            try {
+                album_art_editor_instance_ptr editor = album_art_editor::g_open(NULL, items[i]->get_path(), abort);
+                editor->set(album_art_ids::cover_front, data, abort);
+                editor->commit(abort);
+                written++;
+            } catch (std::exception const &) {
+                // format without artwork support, or a read-only file
+            }
+        }
+        return written > 0;
+    }
+
+    static bool write_folder_cover(const BatchAlbum & entry, const pfc::array_t<t_uint8> & bytes, abort_callback & abort) {
+        pfc::string8 target(entry.folder);
+        target << "\\cover.jpg";
+        pfc::string8 write_error;
+        if (write_native_file(target, bytes, write_error)) return true;
+
+        pfc::string8 canonical(entry.items[0]->get_path());
+        canonical << "\\cover.jpg";
+        try {
+            file::ptr output;
+            filesystem::g_open_write_new(output, canonical, abort);
+            output->write(bytes.get_ptr(), bytes.get_size(), abort);
+            return true;
+        } catch (std::exception const &) {
+            return false;
+        }
+    }
+
+    std::vector<BatchAlbum> m_albums;
+};
+
+void print_list(const char * heading, const std::vector<pfc::string8> & entries) {
+    if (entries.empty()) return;
+    console::print(heading);
+    for (size_t i = 0; i < entries.size(); i++) console::print(pfc::string8("  ") << entries[i]);
+}
+
+} // namespace
+
+void cover_batch_run() {
+    service_ptr_t<BatchScanTask> scan = new service_impl_t<BatchScanTask>();
+    if (!threaded_process::get()->run_modal(scan, threaded_process::flag_show_progress | threaded_process::flag_show_item |
+                                                      threaded_process::flag_show_abort,
+                                            core_api::get_main_window(), "Looking for albums without cover art"))
+        return;
+
+    if (scan->m_missing.empty()) {
+        pfc::string8 message("All ");
+        message << scan->m_scanned << " album(s) in the media library already have cover art.";
+        console::print(message);
+        fb2k::showToast(message);
+        return;
+    }
+
+    pfc::string8 question("Scanned ");
+    question << scan->m_scanned << " album(s), " << scan->m_missing.size() << " have no cover art:\n\n";
+    for (size_t i = 0; i < scan->m_missing.size() && i < 12; i++) {
+        question << "  - " << scan->m_missing[i].album;
+        if (!scan->m_missing[i].artist.is_empty()) question << "  (" << scan->m_missing[i].artist << ")";
+        question << "\n";
+    }
+    if (scan->m_missing.size() > 12) question << "  ... and " << (scan->m_missing.size() - 12) << " more (see the Console)\n";
+    question << "\nSearch online and fill them now? Only exact album matches are applied; the rest is left for the "
+                "single-album menu item, where you can pick from the previews.";
+    if (!ask_yes_no(question)) return;
+
+    service_ptr_t<BatchFillTask> fill = new service_impl_t<BatchFillTask>(scan->m_missing);
+    if (!threaded_process::get()->run_modal(fill, threaded_process::flag_show_progress | threaded_process::flag_show_item |
+                                                      threaded_process::flag_show_abort,
+                                            core_api::get_main_window(), "Filling missing cover art"))
+        return;
+
+    pfc::string8 summary("Cover art filled for ");
+    summary << fill->m_filled << " of " << scan->m_missing.size() << " album(s)";
+    if (!fill->m_unmatched.empty()) summary << ", " << fill->m_unmatched.size() << " without a confident match";
+    if (!fill->m_failed.empty()) summary << ", " << fill->m_failed.size() << " failed";
+    console::print(summary);
+    print_list("No confident match (use the single-album menu item):", fill->m_unmatched);
+    print_list("Could not write:", fill->m_failed);
+    fb2k::showToast(summary);
+
+    pfc::string8 detail(summary);
+    if (!fill->m_unmatched.empty() || !fill->m_failed.empty()) {
+        detail << "\n\nThe rest is listed in the Console (View -> Console):";
+        size_t shown = 0;
+        for (size_t i = 0; i < fill->m_unmatched.size() && shown < 8; i++, shown++) detail << "\n  - " << fill->m_unmatched[i];
+        for (size_t i = 0; i < fill->m_failed.size() && shown < 8; i++, shown++) detail << "\n  - " << fill->m_failed[i];
+    }
+    show_info(detail);
+}
+
+// ------------------------------------------------------------ menu entry --
+
+static const GUID guid_batch_command = {0x2b7d1a94, 0x5e6f, 0x4c31, {0x8f, 0x2a, 0x11, 0x9d, 0x5e, 0x77, 0x30, 0xc4}};
+
+class CoverBatchCommand : public mainmenu_commands {
+public:
+    t_uint32 get_command_count() override { return 1; }
+    GUID get_command(t_uint32 index) override { return guid_batch_command; }
+    void get_name(t_uint32 index, pfc::string_base & out) override { out = "Fill missing cover art..."; }
+    bool get_description(t_uint32 index, pfc::string_base & out) override {
+        out = "Finds albums in the media library that have no cover art and fills them from the online sources";
+        return true;
+    }
+    GUID get_parent() override { return mainmenu_groups::library; }
+    void execute(t_uint32 index, service_ptr ctx) override { cover_batch_run(); }
+};
+
+FB2K_SERVICE_FACTORY(CoverBatchCommand);
