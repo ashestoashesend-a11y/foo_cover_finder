@@ -925,6 +925,31 @@ void cover_finder_run(metadb_handle_list_cref items) {
 
 namespace {
 
+// A crash takes the whole process with it, so progress goes to a file that is
+// flushed on every line; the last line survives and says where it died.
+void batch_log(const char * text) {
+    pfc::string8 line;
+    line << text << "\r\n";
+    char path[MAX_PATH] = {};
+    if (GetTempPathA(MAX_PATH, path) == 0) return;
+    pfc::string8 file(path);
+    file << "foo_cover_finder-batch.log";
+    HANDLE handle = CreateFileA(file, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_ALWAYS,
+                                FILE_ATTRIBUTE_NORMAL, NULL);
+    if (handle == INVALID_HANDLE_VALUE) return;
+    DWORD written = 0;
+    WriteFile(handle, line.get_ptr(), (DWORD)line.get_length(), &written, NULL);
+    CloseHandle(handle);
+}
+
+// Separate name: a pfc::string8 argument would otherwise be ambiguous with the
+// const char * overload.
+void batch_log_line(const pfc::string8 & text) { batch_log(text.get_ptr()); }
+
+} // namespace
+
+namespace {
+
 struct BatchAlbum {
     pfc::string8 folder;
     pfc::string8 album;
@@ -998,6 +1023,7 @@ private:
     void scan(threaded_process_status & status, abort_callback & abort) {
         metadb_handle_list_cref everything = m_library;
         status.set_item("Reading the media library");
+        batch_log_line(pfc::string8("scan: library holds ") << everything.get_count() << " item(s)");
 
         std::vector<BatchAlbum> albums;
         std::map<std::string, size_t> seen;
@@ -1047,6 +1073,8 @@ private:
             if (!album_has_cover(albums[i], albums[i].mixed)) m_missing.push_back(albums[i]);
         }
         m_scanned = albums.size();
+        batch_log_line(pfc::string8("scan: ") << m_scanned << " album(s), " << (t_size)m_missing.size()
+                                         << " without cover art");
         status.set_item("");
     }
 
@@ -1074,6 +1102,7 @@ public:
             if (abort.is_aborting()) throw exception_aborted();
             const BatchAlbum & entry = m_albums[i];
             status.set_item(entry.album);
+            batch_log_line(pfc::string8("search: ") << entry.album);
 
             std::vector<CoverCandidate> candidates;
             pfc::string8 search_error;
@@ -1089,11 +1118,14 @@ public:
                     break;
                 }
             }
+            batch_log_line(pfc::string8("  candidates: ") << (t_size)candidates.size() << ", best score: "
+                                                      << (candidates.empty() ? -1 : candidates[0].score));
             if (chosen == candidates.size()) {
                 m_unmatched.push_back(describe(entry));
                 continue;
             }
 
+            batch_log_line(pfc::string8("  downloading from ") << candidates[chosen].source);
             pfc::array_t<t_uint8> bytes;
             pfc::string8 download_error;
             if (!http_get(candidates[chosen].image_url, NULL, bytes, abort, download_error) || bytes.get_size() == 0) {
@@ -1101,6 +1133,8 @@ public:
                 continue;
             }
 
+            batch_log_line(pfc::string8("  write: ") << (entry.mixed ? "embed" : "cover.jpg") << " (" << bytes.get_size()
+                                                << " bytes)");
             if (entry.mixed) {
                 if (!embed(entry.items, bytes, abort)) {
                     m_failed.push_back(describe(entry));
@@ -1111,13 +1145,14 @@ public:
                 continue;
             }
 
-            metadb_io::get()->dispatch_refresh(entry.items);
+            m_refresh.add_items(entry.items); // refreshed by the caller: metadb_io is main-thread only
             m_filled++;
         }
         status.set_item("");
     }
 
     t_size m_filled = 0;
+    metadb_handle_list m_refresh;
     std::vector<pfc::string8> m_unmatched;
     std::vector<pfc::string8> m_failed;
     pfc::string8 m_error;
@@ -1217,6 +1252,7 @@ void cover_batch_run() {
                 "single-album menu item, where you can pick from the previews.";
     if (!ask_yes_no(question)) return;
 
+    batch_log("fill: starting");
     service_ptr_t<BatchFillTask> fill = new service_impl_t<BatchFillTask>(scan->m_missing);
     if (!threaded_process::get()->run_modal(fill, threaded_process::flag_show_progress | threaded_process::flag_show_item |
                                                       threaded_process::flag_show_abort,
@@ -1227,6 +1263,8 @@ void cover_batch_run() {
         show_error(fill->m_error);
         return;
     }
+    batch_log_line(pfc::string8("fill: done, wrote ") << fill->m_filled << " album(s)");
+    if (fill->m_refresh.get_count() > 0) metadb_io::get()->dispatch_refresh(fill->m_refresh);
 
     pfc::string8 summary("Cover art filled for ");
     summary << fill->m_filled << " of " << scan->m_missing.size() << " album(s)";
