@@ -572,10 +572,66 @@ private:
 
 // ------------------------------------------------------------- plumbing ----
 
-bool folder_of(const metadb_handle_ptr & item, pfc::string8 & folder) {
+// metadb hands out canonical paths, which for local files can still be
+// "file:///C:\..." URLs; everything that touches the disk needs the native form.
+// "file:///C:/Music/a%20b.flac" -> "C:\Music\a b.flac". g_get_display_path is
+// supposed to do this, but it does not always (and it happily leaves the URL
+// alone when the path is already in that shape), so the conversion is repeated
+// by hand afterwards.
+void undecorate_file_url(pfc::string8 & text) {
+    if (text.find_first("file://") != 0) return;
+    pfc::string8 rest(text.get_ptr() + 7);
+    // file:///C:/... keeps a slash in front of the drive letter
+    if (rest.get_length() > 2 && rest[0] == '/' && rest[2] == ':') rest = pfc::string8(rest.get_ptr() + 1);
+
+    pfc::string8 decoded;
+    for (t_size i = 0; i < rest.get_length(); i++) {
+        const char c = rest[i];
+        if (c == '%' && i + 2 < rest.get_length()) {
+            int value = 0;
+            bool valid = true;
+            for (int k = 1; k <= 2; k++) {
+                const char digit = rest[i + k];
+                value <<= 4;
+                if (digit >= '0' && digit <= '9')
+                    value += digit - '0';
+                else if (digit >= 'a' && digit <= 'f')
+                    value += digit - 'a' + 10;
+                else if (digit >= 'A' && digit <= 'F')
+                    value += digit - 'A' + 10;
+                else
+                    valid = false;
+            }
+            if (valid) {
+                decoded.add_char((char)value);
+                i += 2;
+                continue;
+            }
+        }
+        decoded.add_char(c);
+    }
+    text = decoded;
+}
+
+bool native_path_of(const metadb_handle_ptr & item, pfc::string8 & out) {
     const char * path = item->get_path();
     if (path == NULL || *path == 0) return false;
-    pfc::string8 text(path);
+    try {
+        filesystem::g_get_display_path(path, out);
+    } catch (std::exception const &) {
+        return false;
+    }
+    if (out.is_empty()) return false;
+    undecorate_file_url(out);
+    // Anything still carrying a protocol is remote (upnp, http) and has no
+    // folder to write into.
+    if (out.find_first("://") != pfc::infinite_size) return false;
+    return true;
+}
+
+bool folder_of(const metadb_handle_ptr & item, pfc::string8 & folder) {
+    pfc::string8 text;
+    if (!native_path_of(item, text)) return false;
     t_size cut = pfc::infinite_size;
     for (t_size i = text.get_length(); i > 0; i--) {
         const char c = text[i - 1];
