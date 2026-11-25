@@ -542,32 +542,58 @@ private:
     pfc::string8 m_album;
 };
 
+bool write_native_file(const char * path, const pfc::array_t<t_uint8> & bytes, pfc::string8 & error) {
+    pfc::stringcvt::string_wide_from_utf8 wide_path(path);
+    HANDLE file = CreateFileW(wide_path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) {
+        error << "Could not create " << path;
+        return false;
+    }
+    DWORD written = 0;
+    const BOOL ok = WriteFile(file, bytes.get_ptr(), (DWORD)bytes.get_size(), &written, NULL);
+    CloseHandle(file);
+    if (!ok || written != bytes.get_size()) {
+        error << "Could not write " << path;
+        return false;
+    }
+    return true;
+}
+
 class CoverDownloadTask : public threaded_process_callback {
 public:
-    CoverDownloadTask(pfc::string8 url, pfc::string8 target) : m_url(url), m_target(target) {}
+    CoverDownloadTask(pfc::string8 url, pfc::string8 native_target, pfc::string8 fallback_target)
+        : m_url(url), m_native_target(native_target), m_fallback_target(fallback_target) {}
 
     void run(threaded_process_status & status, abort_callback & abort) override {
         status.set_item("Downloading the cover");
         pfc::array_t<t_uint8> bytes;
         if (!http_get(m_url, NULL, bytes, abort, m_error)) return;
 
-        pfc::stringcvt::string_wide_from_utf8 wide_target(m_target);
-        HANDLE file = CreateFileW(wide_target, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-        if (file == INVALID_HANDLE_VALUE) {
-            m_error << "Could not create " << m_target;
-            return;
+        if (write_native_file(m_native_target, bytes, m_error)) return;
+
+        // Fall back to foobar2000's own filesystem layer with the canonical path:
+        // it accepts the file:/// form that CreateFileW rejects, and it is what
+        // the path came from in the first place.
+        pfc::string8 native_error(m_error);
+        try {
+            {
+                file::ptr output;
+                filesystem::g_open_write_new(output, m_fallback_target, abort);
+                output->write(bytes.get_ptr(), bytes.get_size(), abort);
+            } // the file is closed and flushed when the service pointer goes away
+            m_error.reset();
+        } catch (std::exception const & e) {
+            m_error = native_error;
+            m_error << " (" << e.what() << ")";
         }
-        DWORD written = 0;
-        const BOOL ok = WriteFile(file, bytes.get_ptr(), (DWORD)bytes.get_size(), &written, NULL);
-        CloseHandle(file);
-        if (!ok || written != bytes.get_size()) m_error << "Could not write " << m_target;
     }
 
     pfc::string8 m_error;
 
 private:
     pfc::string8 m_url;
-    pfc::string8 m_target;
+    pfc::string8 m_native_target;
+    pfc::string8 m_fallback_target;
 };
 
 // ------------------------------------------------------------- plumbing ----
@@ -702,8 +728,13 @@ void cover_finder_run(metadb_handle_list_cref items) {
         if (!ask_yes_no(question)) return;
     }
 
+    // Two forms of the same destination: the native path for CreateFileW, and the
+    // path exactly as metadb reported it for foobar2000's filesystem layer.
+    pfc::string8 canonical_target(items[0]->get_path());
+    canonical_target << "\\cover.jpg";
+
     service_ptr_t<CoverDownloadTask> download =
-        new service_impl_t<CoverDownloadTask>(search->m_candidates[chosen].image_url, target);
+        new service_impl_t<CoverDownloadTask>(search->m_candidates[chosen].image_url, target, canonical_target);
     if (!threaded_process::get()->run_modal(download, threaded_process::flag_show_progress | threaded_process::flag_show_item |
                                                           threaded_process::flag_show_abort,
                                             core_api::get_main_window(), "Saving cover art"))
