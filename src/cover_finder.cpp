@@ -425,6 +425,81 @@ void qq_query(const char * term, std::vector<CoverCandidate> & out, abort_callba
     cJSON_Delete(root);
 }
 
+// Album indexes miss plenty of titles that the track index does know, so the
+// same search is repeated one level down: every hit reports its parent album.
+void itunes_song_query(const char * term, std::vector<CoverCandidate> & out, abort_callback & abort, pfc::string8 & error) {
+    pfc::string8 url("https://itunes.apple.com/search?term=");
+    url_encode(term, url);
+    url << "&entity=song&limit=50&country=JP";
+
+    pfc::array_t<t_uint8> body;
+    pfc::string8 request_error;
+    if (!http_get(url, NULL, body, abort, request_error)) {
+        if (error.is_empty()) error << "iTunes: " << request_error;
+        return;
+    }
+    body.append_single(0);
+    cJSON * root = cJSON_Parse((const char *)body.get_ptr());
+    if (root == NULL) return;
+
+    cJSON * results = cJSON_GetObjectItem(root, "results");
+    const int count = cJSON_GetArraySize(results);
+    for (int i = 0; i < count; i++) {
+        cJSON * item = cJSON_GetArrayItem(results, i);
+        const char * album = json_string(item, "collectionName");
+        const char * art = json_string(item, "artworkUrl100");
+        if (album == NULL || art == NULL) continue;
+
+        CoverCandidate candidate;
+        candidate.source = "iTunes";
+        candidate.album = album;
+        const char * artist = json_string(item, "artistName");
+        candidate.artist = artist != NULL ? artist : "";
+        candidate.width = 1200;
+        itunes_art_urls(art, candidate.thumb_url, candidate.image_url);
+        out.push_back(candidate);
+    }
+    cJSON_Delete(root);
+}
+
+void netease_song_query(const char * term, std::vector<CoverCandidate> & out, abort_callback & abort, pfc::string8 & error) {
+    pfc::string8 url("https://music.163.com/api/cloudsearch/pc?s=");
+    url_encode(term, url);
+    url << "&type=1&limit=30";
+
+    pfc::array_t<t_uint8> body;
+    pfc::string8 request_error;
+    if (!http_get(url, "https://music.163.com/", body, abort, request_error)) {
+        if (error.is_empty()) error << "NetEase: " << request_error;
+        return;
+    }
+    body.append_single(0);
+    cJSON * root = cJSON_Parse((const char *)body.get_ptr());
+    if (root == NULL) return;
+
+    cJSON * songs = cJSON_GetObjectItem(cJSON_GetObjectItem(root, "result"), "songs");
+    const int count = cJSON_GetArraySize(songs);
+    for (int i = 0; i < count; i++) {
+        cJSON * song = cJSON_GetArrayItem(songs, i);
+        cJSON * album = cJSON_GetObjectItem(song, "al");
+        const char * name = json_string(album, "name");
+        const char * picture = json_string(album, "picUrl");
+        if (name == NULL || picture == NULL) continue;
+
+        CoverCandidate candidate;
+        candidate.source = "NetEase";
+        candidate.album = name;
+        cJSON * artists = cJSON_GetObjectItem(song, "ar");
+        const char * artist = cJSON_GetArraySize(artists) > 0 ? json_string(cJSON_GetArrayItem(artists, 0), "name") : NULL;
+        candidate.artist = artist != NULL ? artist : "";
+        candidate.width = 1000;
+        candidate.thumb_url = picture;
+        candidate.image_url = picture;
+        out.push_back(candidate);
+    }
+    cJSON_Delete(root);
+}
+
 pfc::string8 first_artist_credit(cJSON * release) {
     cJSON * credits = cJSON_GetObjectItem(release, "artist-credit");
     if (credits == NULL || cJSON_GetArraySize(credits) < 1) return pfc::string8();
@@ -513,6 +588,10 @@ void collect_candidates(const char * artist, const char * album, std::vector<Cov
     qq_query(album_query, raw, abort, error);
     if (abort.is_aborting()) return;
     netease_query(both_query, raw, abort, error);
+    if (abort.is_aborting()) return;
+    itunes_song_query(both_query, raw, abort, error);
+    if (abort.is_aborting()) return;
+    netease_song_query(both_query, raw, abort, error);
     if (abort.is_aborting()) return;
 
     pfc::string8 mb_query("release:\"");
@@ -1081,6 +1160,13 @@ private:
     metadb_handle_list m_library;
 };
 
+// A candidate that is close but not exact: the album name matches loosely, so a
+// human has to say yes before it is written.
+struct NearMatch {
+    BatchAlbum entry;
+    CoverCandidate candidate;
+};
+
 class BatchFillTask : public threaded_process_callback {
 public:
     BatchFillTask(const std::vector<BatchAlbum> & albums) : m_albums(albums) {}
@@ -1106,7 +1192,7 @@ public:
 
             std::vector<CoverCandidate> candidates;
             pfc::string8 search_error;
-            collect_candidates(entry.album, entry.artist, candidates, abort, search_error, 1);
+            collect_candidates(entry.artist, entry.album, candidates, abort, search_error, 1);
             if (abort.is_aborting()) throw exception_aborted();
 
             // Nobody is here to look at previews, so only an exact album name
@@ -1121,6 +1207,17 @@ public:
             batch_log_line(pfc::string8("  candidates: ") << (t_size)candidates.size() << ", best score: "
                                                       << (candidates.empty() ? -1 : candidates[0].score));
             if (chosen == candidates.size()) {
+                // Keep the best loose match; it is offered for review once every
+                // certain one has been written.
+                for (size_t c = 0; c < candidates.size(); c++) {
+                    if (candidates[c].score >= 60) {
+                        NearMatch match;
+                        match.entry = entry;
+                        match.candidate = candidates[c];
+                        m_near.push_back(match);
+                        break;
+                    }
+                }
                 m_unmatched.push_back(describe(entry));
                 continue;
             }
@@ -1153,11 +1250,12 @@ public:
 
     t_size m_filled = 0;
     metadb_handle_list m_refresh;
+    std::vector<NearMatch> m_near;
     std::vector<pfc::string8> m_unmatched;
     std::vector<pfc::string8> m_failed;
     pfc::string8 m_error;
 
-private:
+public:
     static pfc::string8 describe(const BatchAlbum & entry) {
         pfc::string8 text(entry.album);
         if (!entry.artist.is_empty()) text << "  (" << entry.artist << ")";
@@ -1203,7 +1301,53 @@ private:
         }
     }
 
+private:
     std::vector<BatchAlbum> m_albums;
+};
+
+class BatchApplyTask : public threaded_process_callback {
+public:
+    BatchApplyTask(const std::vector<NearMatch> & matches) : m_matches(matches) {}
+
+    void run(threaded_process_status & status, abort_callback & abort) override {
+        try {
+            for (size_t i = 0; i < m_matches.size(); i++) {
+                if (abort.is_aborting()) throw exception_aborted();
+                const NearMatch & match = m_matches[i];
+                status.set_item(match.entry.album);
+                batch_log_line(pfc::string8("apply: ") << match.entry.album << " <- " << match.candidate.album);
+
+                pfc::array_t<t_uint8> bytes;
+                pfc::string8 download_error;
+                if (!http_get(match.candidate.image_url, NULL, bytes, abort, download_error) || bytes.get_size() == 0) {
+                    m_failed.push_back(match.entry.album);
+                    continue;
+                }
+                if (match.entry.mixed ? !BatchFillTask::embed(match.entry.items, bytes, abort)
+                                      : !BatchFillTask::write_folder_cover(match.entry, bytes, abort)) {
+                    m_failed.push_back(match.entry.album);
+                    continue;
+                }
+                m_refresh.add_items(match.entry.items);
+                m_written++;
+            }
+            status.set_item("");
+        } catch (const exception_aborted &) {
+            throw;
+        } catch (std::exception const & e) {
+            m_error << e.what();
+        } catch (...) {
+            m_error = "Unknown error while writing cover art.";
+        }
+    }
+
+    t_size m_written = 0;
+    metadb_handle_list m_refresh;
+    std::vector<pfc::string8> m_failed;
+    pfc::string8 m_error;
+
+private:
+    std::vector<NearMatch> m_matches;
 };
 
 void print_list(const char * heading, const std::vector<pfc::string8> & entries) {
@@ -1263,11 +1407,52 @@ void cover_batch_run() {
         show_error(fill->m_error);
         return;
     }
-    batch_log_line(pfc::string8("fill: done, wrote ") << fill->m_filled << " album(s)");
+    batch_log_line(pfc::string8("fill: done, wrote ") << fill->m_filled << " album(s), " << (t_size)fill->m_near.size()
+                                                      << " near match(es)");
     if (fill->m_refresh.get_count() > 0) metadb_io::get()->dispatch_refresh(fill->m_refresh);
 
+    // --- review pass: loose matches go in only after a human agrees --------
+    t_size applied = 0;
+    if (!fill->m_near.empty()) {
+        for (size_t i = 0; i < fill->m_near.size(); i++) {
+            console::print(pfc::string8("Close match: ") << fill->m_near[i].entry.album << " -> "
+                                                         << fill->m_near[i].candidate.album << " ("
+                                                         << fill->m_near[i].candidate.source << ", score "
+                                                         << fill->m_near[i].candidate.score << ")");
+        }
+
+        pfc::string8 list;
+        list << (t_size)fill->m_near.size()
+             << " album(s) only matched approximately, so they were left alone:\n\n";
+        for (size_t i = 0; i < fill->m_near.size() && i < 15; i++) {
+            list << "  " << fill->m_near[i].entry.album << "\n      -> " << fill->m_near[i].candidate.album
+                 << "  (" << fill->m_near[i].candidate.source << ")\n";
+        }
+        if (fill->m_near.size() > 15)
+            list << "  ... and " << (t_size)(fill->m_near.size() - 15) << " more (see the Console)\n";
+        list << "\nWrite these covers as well?";
+
+        if (ask_yes_no(list)) {
+            service_ptr_t<BatchApplyTask> apply = new service_impl_t<BatchApplyTask>(fill->m_near);
+            if (threaded_process::get()->run_modal(apply, threaded_process::flag_show_progress |
+                                                               threaded_process::flag_show_item |
+                                                               threaded_process::flag_show_abort,
+                                                   core_api::get_main_window(), "Writing the close matches")) {
+                if (!apply->m_error.is_empty()) {
+                    show_error(apply->m_error);
+                } else {
+                    if (apply->m_refresh.get_count() > 0) metadb_io::get()->dispatch_refresh(apply->m_refresh);
+                    applied = apply->m_written;
+                    fill->m_unmatched = std::vector<pfc::string8>();
+                    for (size_t i = 0; i < apply->m_failed.size(); i++) fill->m_unmatched.push_back(apply->m_failed[i]);
+                }
+            }
+        }
+    }
+
     pfc::string8 summary("Cover art filled for ");
-    summary << fill->m_filled << " of " << scan->m_missing.size() << " album(s)";
+    summary << (fill->m_filled + applied) << " of " << scan->m_missing.size() << " album(s)";
+    if (applied > 0) summary << " (" << applied << " from close matches)";
     if (!fill->m_unmatched.empty()) summary << ", " << fill->m_unmatched.size() << " without a confident match";
     if (!fill->m_failed.empty()) summary << ", " << fill->m_failed.size() << " failed";
     console::print(summary);
