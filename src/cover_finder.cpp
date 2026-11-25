@@ -3,6 +3,8 @@
 #include "cover_finder.h"
 #include "cover_chooser.h"
 
+#include <SDK/album_art_helpers.h>
+
 #include <cJSON.h>
 #include <winhttp.h>
 
@@ -596,6 +598,58 @@ private:
     pfc::string8 m_fallback_target;
 };
 
+// Mixed folders: cover.jpg belongs to the whole folder, so a per-album image
+// would show up on every unrelated track in there. In that case the picture goes
+// into each selected file's own tags instead.
+class CoverEmbedTask : public threaded_process_callback {
+public:
+    CoverEmbedTask(pfc::string8 url, metadb_handle_list items) : m_url(url), m_items(items) {}
+
+    void run(threaded_process_status & status, abort_callback & abort) override {
+        status.set_item("Downloading the cover");
+        pfc::array_t<t_uint8> bytes;
+        if (!http_get(m_url, NULL, bytes, abort, m_error)) return;
+
+        album_art_data_ptr data;
+        try {
+            data = album_art_data_impl::g_create(bytes.get_ptr(), bytes.get_size());
+        } catch (std::exception const & e) {
+            m_error << "Could not prepare the image: " << e.what();
+            return;
+        }
+
+        for (t_size i = 0; i < m_items.get_count(); i++) {
+            if (abort.is_aborting()) throw exception_aborted();
+            status.set_item(m_items[i]->get_path());
+            pfc::string8 what_failed;
+            try {
+                album_art_editor_instance_ptr editor = album_art_editor::g_open(NULL, m_items[i]->get_path(), abort);
+                editor->set(album_art_ids::cover_front, data, abort);
+                editor->commit(abort);
+                m_written++;
+            } catch (std::exception const & e) {
+                m_failed++;
+                if (m_first_failure.is_empty()) m_first_failure << m_items[i]->get_path() << ": " << e.what();
+            }
+        }
+        status.set_item("");
+
+        if (m_written == 0) {
+            m_error = "No file could take the cover art. ";
+            if (!m_first_failure.is_empty()) m_error << m_first_failure;
+        }
+    }
+
+    t_size m_written = 0;
+    t_size m_failed = 0;
+    pfc::string8 m_first_failure;
+    pfc::string8 m_error;
+
+private:
+    pfc::string8 m_url;
+    metadb_handle_list m_items;
+};
+
 // ------------------------------------------------------------- plumbing ----
 
 // metadb hands out canonical paths, which for local files can still be
@@ -674,6 +728,33 @@ bool folder_of(const metadb_handle_ptr & item, pfc::string8 & folder) {
 
 } // namespace
 
+// Does this folder hold anything besides the album being searched for? Uses the
+// media library, which is the only cheap way to look at files we were not given.
+bool folder_is_mixed(const pfc::string8 & folder, const char * album, t_size & tracks_in_folder) {
+    tracks_in_folder = 0;
+    bool mixed = false;
+    try {
+        metadb_handle_list everything;
+        library_manager::get()->get_all_items(everything);
+        const std::string wanted_folder = lowered(folder.get_ptr());
+        const std::string wanted_album = normalized(album);
+
+        for (t_size i = 0; i < everything.get_count(); i++) {
+            pfc::string8 item_folder;
+            if (!folder_of(everything[i], item_folder)) continue;
+            if (lowered(item_folder.get_ptr()) != wanted_folder) continue;
+            tracks_in_folder++;
+
+            const file_info & info = everything[i]->get_info_ref()->info();
+            if (normalized(info.meta_get("album", 0)) != wanted_album) mixed = true;
+        }
+    } catch (std::exception const & e) {
+        console::print(pfc::string8("Cover art: could not inspect the folder (") << e.what()
+                                                                              << "), assuming it holds a single album.");
+    }
+    return mixed;
+}
+
 void cover_finder_run(metadb_handle_list_cref items) {
     if (items.get_count() == 0) return;
 
@@ -720,6 +801,39 @@ void cover_finder_run(metadb_handle_list_cref items) {
     size_t chosen = 0;
     if (!cover_chooser_show(core_api::get_main_window(), search->m_candidates, chosen)) return;
 
+    // A cover.jpg is shared by everything in the folder, so it is only the right
+    // answer when the folder actually holds this album and nothing else.
+    t_size tracks_in_folder = 0;
+    if (folder_is_mixed(folder, album, tracks_in_folder)) {
+        pfc::string8 question("This folder holds tracks from more than one album (");
+        question << tracks_in_folder << " tracks), so cover.jpg would show up on all of them.\n\nThe cover will be embedded "
+                 << "into the tags of the " << items.get_count()
+                 << " selected track(s) instead, which rewrites those files.\n\nGo ahead?";
+        if (!ask_yes_no(question)) return;
+
+        metadb_handle_list selected;
+        selected.add_items(items);
+        service_ptr_t<CoverEmbedTask> embed =
+            new service_impl_t<CoverEmbedTask>(search->m_candidates[chosen].image_url, selected);
+        if (!threaded_process::get()->run_modal(embed, threaded_process::flag_show_progress |
+                                                           threaded_process::flag_show_item |
+                                                           threaded_process::flag_show_abort,
+                                                core_api::get_main_window(), "Embedding cover art"))
+            return;
+        if (!embed->m_error.is_empty()) {
+            show_error(embed->m_error);
+            return;
+        }
+
+        metadb_io::get()->dispatch_refresh(items);
+        pfc::string8 done("Cover art embedded into ");
+        done << embed->m_written << " track(s)";
+        if (embed->m_failed > 0) done << ", " << embed->m_failed << " skipped (format does not support artwork)";
+        console::print(done);
+        fb2k::showToast(done);
+        return;
+    }
+
     pfc::string8 target = folder;
     target << "\\cover.jpg";
     if (filesystem::g_exists(target, fb2k::noAbort)) {
@@ -747,5 +861,8 @@ void cover_finder_run(metadb_handle_list_cref items) {
 
     // Nudge the metadb so viewers reload the artwork for these tracks.
     metadb_io::get()->dispatch_refresh(items);
-    console::print(pfc::string8("Cover art saved to ") << target);
+    pfc::string8 done("Cover art saved to ");
+    done << target;
+    console::print(done);
+    fb2k::showToast(done);
 }
