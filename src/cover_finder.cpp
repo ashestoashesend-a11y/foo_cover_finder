@@ -91,6 +91,10 @@ bool http_get(const char * url, const char * referer, pfc::array_t<t_uint8> & ou
         return false;
     }
     WinHttpSetTimeouts(session, 10000, 10000, 15000, 20000);
+    // Cover Art Archive (and occasionally iTunes) answer with a redirect to the
+    // actual image, and WinHTTP does not follow those unless told to.
+    DWORD redirect_policy = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
+    WinHttpSetOption(session, WINHTTP_OPTION_REDIRECT_POLICY, &redirect_policy, sizeof(redirect_policy));
 
     bool ok = false;
     HINTERNET connection = WinHttpConnect(session, host, parts.nPort, 0);
@@ -336,8 +340,118 @@ void netease_query(const char * term, std::vector<CoverCandidate> & out, abort_c
     cJSON_Delete(root);
 }
 
-// Both sources do badly on "<artist> <album>" as one search term, so ask twice
-// (artist, then album), merge, score against the tags and keep the best few.
+// QQ Music's proper search API needs a signed request; the "smart box"
+// suggestion endpoint answers without one and does return albums, a couple at a
+// time, which is enough when it is queried once per term.
+void qq_query(const char * term, std::vector<CoverCandidate> & out, abort_callback & abort, pfc::string8 & error) {
+    pfc::string8 url("https://c.y.qq.com/splcloud/fcgi-bin/smartbox_new.fcg?key=");
+    url_encode(term, url);
+    url << "&format=json";
+
+    pfc::array_t<t_uint8> body;
+    pfc::string8 request_error;
+    if (!http_get(url, "https://y.qq.com/", body, abort, request_error)) {
+        if (error.is_empty()) error << "QQ Music: " << request_error;
+        return;
+    }
+    body.append_single(0);
+    cJSON * root = cJSON_Parse((const char *)body.get_ptr());
+    if (root == NULL) {
+        if (error.is_empty()) error = "QQ Music: the reply could not be parsed.";
+        return;
+    }
+
+    cJSON * albums = cJSON_GetObjectItem(cJSON_GetObjectItem(cJSON_GetObjectItem(root, "data"), "album"), "itemlist");
+    const int count = cJSON_GetArraySize(albums);
+    for (int i = 0; i < count; i++) {
+        cJSON * album_object = cJSON_GetArrayItem(albums, i);
+        const char * mid = json_string(album_object, "mid");
+        const char * album = json_string(album_object, "name");
+        if (mid == NULL || album == NULL || *mid == 0) continue;
+
+        CoverCandidate candidate;
+        candidate.source = "QQ Music";
+        candidate.album = album;
+        const char * artist = json_string(album_object, "singer");
+        candidate.artist = artist != NULL ? artist : "";
+        candidate.width = 800;
+        // Built from the album mid instead of patching the 180x180 URL the API
+        // hands out, which ends with a crop suffix that must not survive.
+        candidate.thumb_url = "https://y.gtimg.cn/music/photo_new/T002R300x300M000";
+        candidate.thumb_url << mid << ".jpg";
+        candidate.image_url = "https://y.gtimg.cn/music/photo_new/T002R800x800M000";
+        candidate.image_url << mid << ".jpg";
+        out.push_back(candidate);
+    }
+    cJSON_Delete(root);
+}
+
+pfc::string8 first_artist_credit(cJSON * release) {
+    cJSON * credits = cJSON_GetObjectItem(release, "artist-credit");
+    if (credits == NULL || cJSON_GetArraySize(credits) < 1) return pfc::string8();
+    const char * name = json_string(cJSON_GetArrayItem(credits, 0), "name");
+    return pfc::string8(name != NULL ? name : "");
+}
+
+// MusicBrainz only indexes the metadata; the images live at Cover Art Archive,
+// one extra request per release, and MusicBrainz asks for at most one request a
+// second - hence the sleeps and the small probe budget.
+void musicbrainz_query(const char * query, std::vector<CoverCandidate> & out, abort_callback & abort, pfc::string8 & error) {
+    pfc::string8 url("https://musicbrainz.org/ws/2/release/?query=");
+    url_encode(query, url);
+    url << "&fmt=json&limit=6";
+
+    pfc::array_t<t_uint8> body;
+    pfc::string8 request_error;
+    if (!http_get(url, NULL, body, abort, request_error)) {
+        if (error.is_empty()) error << "MusicBrainz: " << request_error;
+        return;
+    }
+    body.append_single(0);
+    cJSON * root = cJSON_Parse((const char *)body.get_ptr());
+    if (root == NULL) {
+        if (error.is_empty()) error = "MusicBrainz: the reply could not be parsed.";
+        return;
+    }
+
+    cJSON * releases = cJSON_GetObjectItem(root, "releases");
+    const int count = cJSON_GetArraySize(releases);
+    int probed = 0;
+    for (int i = 0; i < count && probed < 3; i++) {
+        if (abort.is_aborting()) break;
+        cJSON * release = cJSON_GetArrayItem(releases, i);
+        const char * id = json_string(release, "id");
+        const char * album = json_string(release, "title");
+        if (id == NULL || album == NULL) continue;
+
+        pfc::string8 front("https://coverartarchive.org/release/");
+        front << id << "/front-500";
+
+        ::Sleep(1100);
+        pfc::array_t<t_uint8> image;
+        pfc::string8 image_error;
+        if (!http_get(front, NULL, image, abort, image_error)) continue; // 404 = this release has no front cover
+        probed++;
+
+        CoverCandidate candidate;
+        candidate.source = "MusicBrainz";
+        candidate.album = album;
+        candidate.artist = first_artist_credit(release);
+        candidate.width = 500;
+        candidate.thumb = image; // already downloaded, no second fetch
+        candidate.thumb_url = front;
+        candidate.image_url = "https://coverartarchive.org/release/";
+        candidate.image_url << id << "/front-1200";
+        out.push_back(candidate);
+    }
+    cJSON_Delete(root);
+}
+
+// No single source is good on its own: iTunes chokes on "<artist> <album>" as
+// one term, QQ Music's key-less endpoint returns two albums at a time, NetEase
+// is strong on anime releases and MusicBrainz only sometimes has scans. So ask
+// every source with the terms it handles, merge, score against the tags and
+// keep the best few.
 void collect_candidates(const char * artist, const char * album, std::vector<CoverCandidate> & out, abort_callback & abort,
                         pfc::string8 & error) {
     std::vector<CoverCandidate> raw;
@@ -351,10 +465,20 @@ void collect_candidates(const char * artist, const char * album, std::vector<Cov
     if (!artist_query.is_empty()) {
         itunes_query(artist_query, raw, abort, error);
         if (abort.is_aborting()) return;
+        qq_query(artist_query, raw, abort, error);
+        if (abort.is_aborting()) return;
     }
     itunes_query(album_query, raw, abort, error);
     if (abort.is_aborting()) return;
+    qq_query(album_query, raw, abort, error);
+    if (abort.is_aborting()) return;
     netease_query(both_query, raw, abort, error);
+    if (abort.is_aborting()) return;
+
+    pfc::string8 mb_query("release:\"");
+    mb_query << album_query << "\"";
+    if (!artist_query.is_empty()) mb_query << " AND artist:\"" << artist_query << "\"";
+    musicbrainz_query(mb_query, raw, abort, error);
     if (abort.is_aborting()) return;
 
     for (size_t i = 0; i < raw.size(); i++) raw[i].score = score_candidate(album, artist, raw[i]);
@@ -403,6 +527,7 @@ public:
         for (size_t i = 0; i < m_candidates.size(); i++) {
             if (abort.is_aborting()) throw exception_aborted();
             status.set_item(m_candidates[i].album);
+            if (m_candidates[i].thumb.get_size() > 0) continue; // fetched while searching
             pfc::string8 ignored;
             http_get(m_candidates[i].thumb_url, NULL, m_candidates[i].thumb, abort, ignored);
         }
